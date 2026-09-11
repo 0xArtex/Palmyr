@@ -113,6 +113,8 @@ Each takes `<name|id>` from the local cache or a numeric Hetzner id directly.
 | `palmyr compute reset-password <name\|id>` | $0.10 | Rotate the root password (console use; SSH password auth is disabled on Palmyr boxes). |
 | `palmyr compute console <name\|id>` | $0.10 | noVNC console URL (`wssUrl` + `password`, expires ~1 min). Break-glass when SSH is down. |
 | `palmyr compute list` | $0.01 | List your servers. |
+| `palmyr compute renew <name\|id>` | same as deploy | Buy another billing period. See [Renewals](#renewals). |
+| `palmyr compute restore <id>` | same as deploy | Rebuild a server destroyed for non-payment, from its snapshot. |
 | `palmyr compute delete <name\|id>` | $0.10 | Terminate and stop billing. |
 
 ### SSH keys
@@ -122,6 +124,58 @@ Each takes `<name|id>` from the local cache or a numeric Hetzner id directly.
 | `palmyr compute ssh-key add <pubkey-file> [--name "label"]` | $0.10 | Upload a key to Hetzner. Returns a numeric `id` for `--ssh-key`; reusable across deploys. |
 | `palmyr compute ssh-key list` | $0.01 | List uploaded keys with fingerprints. |
 | `palmyr compute ssh-key delete <id>` | $0.01 | Remove a key from Hetzner. Existing servers keep it in `authorized_keys`. |
+
+## Renewals
+
+Servers are billed **monthly**. A deploy buys 30 days; `renew` buys 30 more at the
+same per-type price. Renewing early stacks onto the time you have left rather
+than discarding it, so there is no penalty for renewing ahead of expiry.
+
+Every `GET /compute/servers` response carries a `billing` block, so an agent
+never has to track the date itself:
+
+```json
+{
+  "id": "165115762",
+  "name": "patchdesk-layout",
+  "billing": {
+    "state": "active",
+    "paidThrough": "2026-10-08T10:04:21.000Z",
+    "daysRemaining": 28,
+    "renew": "POST /compute/servers/165115762/renew"
+  }
+}
+```
+
+### If a period lapses
+
+Nothing happens silently, and nothing happens without a notice first. When
+`paidThrough` passes, the server walks down a ladder — each step is announced
+to the owner's inbox and webhook, and any renewal at any point resets it:
+
+| When | `state` | What happens |
+|---|---|---|
+| Period ends | `expired` | You get a notice. The server keeps running. |
+| Notice + 3 days | `idled` | Powered off. Disk untouched — `renew` powers it straight back on. |
+| Notice + 7 days | `terminated` | Snapshotted, then destroyed. Hetzner billing stops. |
+| Termination + 30 days | — | The snapshot is deleted. The data is then gone for good. |
+
+The grace clock runs from the **notice**, not from the expiry date — so a
+server that has been overdue for a while still gets the full window from the
+day you are first told.
+
+A `terminated` server is rebuilt with `restore`, which restores the disk from
+that snapshot and buys a fresh period:
+
+```bash
+palmyr compute restore 165115762
+```
+
+<Warning>
+`restore` builds a **new** server — it gets a new id and a new IP. Update
+anything that pointed at the old ones. After the snapshot's 30-day retention
+elapses there is nothing left to restore from.
+</Warning>
 
 ## Safety
 

@@ -36,6 +36,16 @@ function restrictPerms(path: string, mode: number): void {
 }
 restrictPerms(DATA_DIR, 0o700);
 
+/**
+ * Length of one paid VPS billing period, in days. A deploy payment buys this
+ * much runtime; `POST /compute/servers/:id/renew` buys another. Also used to
+ * backfill `paid_through` for servers created before the column existed.
+ */
+export const SERVER_BILLING_DAYS = Math.max(
+  1,
+  parseInt(process.env.PALMYR_VPS_BILLING_DAYS ?? "30", 10) || 30,
+);
+
 // Initialize SQLite database
 export const db: Database.Database = new Database(DB_PATH);
 
@@ -507,6 +517,36 @@ export function initDatabase(): void {
   // Migration: configure-openclaw flips this flag. Added after the original
   // CREATE TABLE shipped, so guard against the 'duplicate column' on re-run.
   try { db.exec("ALTER TABLE servers ADD COLUMN openclaw_configured INTEGER DEFAULT 0"); } catch {}
+
+  // Servers have been sold as "monthly" (GET /compute/plans has always said
+  // billingPeriod: "monthly") but nothing ever recorded when the month ended,
+  // so a single deploy payment bought an indefinitely-running box — several
+  // tenants ran 100+ days on one month's fee. These columns give every server
+  // an explicit `paid_through` plus a timestamp per rung of the lapse ladder
+  // (notify -> idle -> snapshot+terminate). The ladder itself lives in
+  // services/compute-lifecycle.ts; storage.setServer carries these forward so
+  // a status refresh can't reset them.
+  for (const col of [
+    "ADD COLUMN paid_through TEXT",
+    "ADD COLUMN expiry_notified_at TEXT",
+    "ADD COLUMN idled_at TEXT",
+    "ADD COLUMN terminated_at TEXT",
+    "ADD COLUMN snapshot_id TEXT",
+    "ADD COLUMN snapshot_expires_at TEXT",
+  ]) {
+    try { db.exec("ALTER TABLE servers " + col); } catch {}
+  }
+
+  // Backfill: every server that predates this column was sold as one month
+  // from creation, so that's the period it actually bought. Long-expired rows
+  // land in the ladder at the notify rung on the next sweep — nothing is
+  // powered off or destroyed without a notification first.
+  db.prepare(
+    `UPDATE servers
+        SET paid_through = datetime(created_at, ?)
+      WHERE paid_through IS NULL`
+  ).run(`+${SERVER_BILLING_DAYS} days`);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_servers_paid_through ON servers(paid_through)");
 
   // Vestigial: the managed third-party API-key feature was removed (it only
   // ever issued fake stub keys). The table is retained, inert, so legacy

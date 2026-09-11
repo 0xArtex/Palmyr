@@ -622,6 +622,11 @@ app.listen(config.port, () => {
   // on-chain EIP-3009 nonce + Laso's account state tell us which paid (adopt
   // the card / recover the balance) vs never paid (refund the agent).
   startCardPurchaseRecovery();
+  // Enforce the VPS billing period: notify on lapse, power off after the idle
+  // grace, then snapshot + destroy. Servers were sold as monthly but nothing
+  // ever ended the period, so one deploy fee ran a box indefinitely.
+  // PALMYR_VPS_LIFECYCLE_DISABLED=1 turns the whole sweep off.
+  void import("./services/compute-lifecycle").then(m => m.startComputeLifecycle());
   if (embeddingsAvailable()) {
     // Non-blocking: compute any missing provider embeddings in the background.
     ensureProviderEmbeddings().catch(err =>

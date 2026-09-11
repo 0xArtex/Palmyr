@@ -737,6 +737,23 @@ export class Palmyr {
   }
 
   /**
+   * Buy another billing period for a running (or idled-for-non-payment)
+   * server. Costs the same as the original deploy for that type; renewing
+   * early stacks onto the time left rather than discarding it.
+   */
+  async computeRenew(serverId: string): Promise<any> {
+    return this.request('POST', `/compute/servers/${serverId}/renew`)
+  }
+
+  /**
+   * Rebuild a server that was destroyed for non-payment, from the snapshot
+   * taken at termination. Returns a NEW server id and IP.
+   */
+  async computeRestore(serverId: string): Promise<any> {
+    return this.request('POST', `/compute/servers/${serverId}/restore`)
+  }
+
+  /**
    * Inject your SSH public key into a freshly-deployed VPS, remove the
    * platform's temporary key, and lock the root password. After this call,
    * only your key can SSH into the box.

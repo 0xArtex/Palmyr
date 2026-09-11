@@ -7,8 +7,14 @@ import { AuthenticatedRequest, ServerAction } from "../types";
 import * as computeService from "../services/compute";
 import { HcloudApiError } from "../services/compute";
 import { refundAndRespond } from "../services/refund";
+import {
+  extendPaidThrough,
+  clearLapseState,
+  lifecycleView,
+} from "../services/compute-lifecycle";
+import { storage } from "../services/storage";
 import { config } from "../config";
-import { db, DATA_DIR } from "../db";
+import { db, DATA_DIR, SERVER_BILLING_DAYS } from "../db";
 
 const router = Router();
 
@@ -683,8 +689,20 @@ router.post("/servers", validateCreateServerBody, requireAuth(deployPriceForRequ
       setImmediate(() => { captureHostKeyPin(pinId, pinIp); });
     }
 
+    // The deploy payment buys one billing period. Stamping it here is what
+    // makes the lapse ladder able to tell a paid server from a squatting one —
+    // before this existed, a single deploy fee ran a box indefinitely.
+    const paidThrough = extendPaidThrough(String(server.id));
+
     res.status(201).json({
       ...response,
+      billing: {
+        periodDays: SERVER_BILLING_DAYS,
+        paidThrough,
+        priceUsdc: server.priceMonthly,
+        renew: `POST /compute/servers/${server.id}/renew`,
+        note: `This deploy covers ${SERVER_BILLING_DAYS} days. Renew before ${paidThrough} to keep the server running.`,
+      },
       // Async-operation envelope (see /.well-known guidance): provisioning isn't
       // complete at response time — cloud-init runs ~60s. Poll the status URL
       // until `status` is terminal. `status` is already present from the server
@@ -766,7 +784,12 @@ router.get("/servers", requireAuth(0.01, 'general'), async (req: AuthenticatedRe
   try {
     const owner = req.agentId || req.payment?.payer || "unknown";
     const servers = await computeService.listServers(owner);
-    res.json({ servers, count: servers.length });
+    // `billing` is the channel that actually reaches an agent — webhooks need a
+    // registered URL, but anything polling this route sees the lapse state.
+    res.json({
+      servers: servers.map(srv => ({ ...srv, billing: lifecycleView(srv) })),
+      count: servers.length,
+    });
   } catch (err: any) {
     res.status(500).json({ error: "Failed to list servers", message: err.message });
   }
@@ -779,9 +802,196 @@ router.get("/servers", requireAuth(0.01, 'general'), async (req: AuthenticatedRe
 router.get("/servers/:id", requireAuth(0.01, 'general'), requireServerOwner, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const server = await computeService.getServer(String(req.params.id));
-    res.json(server);
+    res.json({ ...server, billing: lifecycleView(server) });
   } catch (err: any) {
     res.status(404).json({ error: "Server Not Found", message: err.message });
+  }
+});
+
+/**
+ * x402 pricer for renew/restore. Both buy one more billing period at the same
+ * per-type price as the original deploy, read from the live plan catalog so a
+ * renewal never drifts from what `GET /compute/plans` quotes. Unknown id falls
+ * back to the flat deploy price — the handler refunds anything it can't honour.
+ */
+export function renewPriceForRequest(req: Request): number {
+  const row = db
+    .prepare("SELECT server_type FROM servers WHERE id = ?")
+    .get(String(req.params.id)) as { server_type?: string } | undefined;
+  return priceForServerType(String(row?.server_type || ''));
+}
+
+/**
+ * POST /compute/servers/:id/renew — Buy one more billing period.
+ * Cost: the server type's monthly price (same as deploy).
+ *
+ * Extends `paid_through`, clears the lapse ladder, and powers the box back on
+ * if it had already been idled. Renewing early stacks on the remaining time
+ * rather than discarding it.
+ *
+ * Ownership is checked INSIDE the handler rather than via requireServerOwner
+ * so a non-owner (or a bad id) gets refunded — at $7–$50 a call, silently
+ * eating the payment behind a 404 the way the cheap read routes do isn't ok.
+ */
+router.post("/servers/:id/renew", requireAuth(renewPriceForRequest, 'server', {
+  description: "Renew a server for another billing period. Extends paid_through and powers the server back on if it was idled for non-payment. Owner-only.",
+  category: "compute",
+  tags: ["compute", "billing", "renew"],
+}), async (req: AuthenticatedRequest, res: Response) => {
+  const serverId = String(req.params.id);
+  const caller = req.agentId || req.payment?.payer || "unknown";
+
+  const row = db
+    .prepare("SELECT owner, name, terminated_at, idled_at FROM servers WHERE id = ?")
+    .get(serverId) as { owner: string; name: string; terminated_at: string | null; idled_at: string | null } | undefined;
+
+  if (!row || row.owner !== caller) {
+    // Same 404-don't-confirm-existence posture as requireServerOwner, but with
+    // the money returned.
+    await refundAndRespond(req, res, {
+      reason: `renew rejected: ${caller} is not the owner of ${serverId}`,
+      errorLabel: "Server Not Found",
+      userMessage: `No server with ID ${serverId} — your payment is being refunded.`,
+      httpStatus: 404,
+    });
+    return;
+  }
+
+  if (row.terminated_at) {
+    await refundAndRespond(req, res, {
+      reason: `renew rejected: ${serverId} already terminated`,
+      errorLabel: "Server Terminated",
+      userMessage: "This server was already destroyed — renewing can't bring it back. Use restore to rebuild it from its snapshot; your payment is being refunded.",
+      httpStatus: 409,
+      extra: { restore: `POST /compute/servers/${serverId}/restore` },
+    });
+    return;
+  }
+
+  try {
+    const paidThrough = extendPaidThrough(serverId);
+    const wasIdled = !!row.idled_at;
+    clearLapseState(serverId);
+
+    // Powering back on is what the owner actually paid for — do it before
+    // replying so the response reflects the real state.
+    let poweredOn = false;
+    if (wasIdled) {
+      try {
+        await computeService.serverAction(serverId, "poweron");
+        poweredOn = true;
+      } catch (err: any) {
+        console.warn(`[compute] renew power-on failed for ${serverId}:`, err?.message ?? err);
+      }
+    }
+
+    const server = await computeService.getServer(serverId);
+    res.json({
+      ...server,
+      billing: lifecycleView(server),
+      renewed: true,
+      poweredOn,
+      message: wasIdled
+        ? poweredOn
+          ? `Renewed until ${paidThrough} and powered back on.`
+          : `Renewed until ${paidThrough}. The power-on call failed — retry with POST /compute/servers/${serverId}/actions {"action":"poweron"}.`
+        : `Renewed until ${paidThrough}.`,
+    });
+  } catch (err: any) {
+    await refundAndRespond(req, res, {
+      reason: `renew failed for ${serverId}: ${err?.message || String(err)}`,
+      userMessage: "Could not renew the server — your payment is being refunded.",
+    });
+  }
+});
+
+/**
+ * POST /compute/servers/:id/restore — Rebuild a lapsed server from its snapshot.
+ * Cost: the server type's monthly price (buys the first billing period back).
+ *
+ * A server destroyed by the lapse ladder keeps a snapshot for
+ * PALMYR_VPS_SNAPSHOT_RETAIN_DAYS. This builds a fresh box from it, so the new
+ * server gets a NEW id and a NEW IP — the response carries both.
+ */
+router.post("/servers/:id/restore", requireAuth(renewPriceForRequest, 'server', {
+  description: "Rebuild a server that was destroyed for non-payment, from the snapshot taken at termination. Returns a NEW server id and IP. Owner-only, and only while the snapshot is retained.",
+  category: "compute",
+  tags: ["compute", "billing", "restore"],
+}), async (req: AuthenticatedRequest, res: Response) => {
+  const oldId = String(req.params.id);
+  const caller = req.agentId || req.payment?.payer || "unknown";
+
+  const row = db
+    .prepare("SELECT owner, name, server_type, terminated_at, snapshot_id, snapshot_expires_at FROM servers WHERE id = ?")
+    .get(oldId) as {
+      owner: string; name: string; server_type: string;
+      terminated_at: string | null; snapshot_id: string | null; snapshot_expires_at: string | null;
+    } | undefined;
+
+  if (!row || row.owner !== caller) {
+    await refundAndRespond(req, res, {
+      reason: `restore rejected: ${caller} is not the owner of ${oldId}`,
+      errorLabel: "Server Not Found",
+      userMessage: `No server with ID ${oldId} — your payment is being refunded.`,
+      httpStatus: 404,
+    });
+    return;
+  }
+
+  if (!row.terminated_at || !row.snapshot_id) {
+    await refundAndRespond(req, res, {
+      reason: `restore rejected: ${oldId} has no snapshot to restore from`,
+      errorLabel: "Nothing To Restore",
+      userMessage: row.terminated_at
+        ? "This server's snapshot has already been deleted — there is nothing left to restore. Your payment is being refunded."
+        : "This server is still running; there is nothing to restore. Use renew to extend its billing period. Your payment is being refunded.",
+      httpStatus: 409,
+      extra: row.terminated_at ? {} : { renew: `POST /compute/servers/${oldId}/renew` },
+    });
+    return;
+  }
+
+  try {
+    // Build from the snapshot image id. No install recipes — the disk is
+    // already provisioned; re-running cloud-init would overwrite it.
+    const result = await computeService.createServer(
+      row.name,
+      row.server_type as any,
+      row.snapshot_id,
+      caller,
+      undefined,
+      [],
+    );
+    const { passwordUsable: _pw, installs: _in, ...server } = result;
+
+    const paidThrough = extendPaidThrough(String(server.id));
+
+    // Carry the snapshot pointer onto the new row so its retention clock keeps
+    // running and the GC still reaps it — restoring shouldn't strand an image
+    // nobody is tracking, nor delete the only copy before the rebuild is proven.
+    db.prepare(
+      "UPDATE servers SET snapshot_id = ?, snapshot_expires_at = ? WHERE id = ?",
+    ).run(row.snapshot_id, row.snapshot_expires_at, String(server.id));
+
+    // The terminated record has been superseded.
+    storage.deleteServer(oldId);
+    clearHostKeyPin(oldId);
+
+    const { rootPassword: _drop, ...visible } = server;
+    res.status(201).json({
+      ...visible,
+      billing: lifecycleView({ ...server, paidThrough }),
+      restoredFrom: { serverId: oldId, snapshotId: row.snapshot_id },
+      operation_id: server.id,
+      poll_url: `/compute/servers/${server.id}`,
+      poll_after_seconds: 60,
+      message: `Restored "${row.name}" from snapshot as a new server (${server.id}) at ${server.ipv4 || '<ip>'}. Paid through ${paidThrough}. Note the new id and IP — the old ones are gone.`,
+    });
+  } catch (err: any) {
+    await refundAndRespond(req, res, {
+      reason: `restore failed for ${oldId}: ${err?.message || String(err)}`,
+      userMessage: "Could not restore the server from its snapshot — your payment is being refunded. The snapshot is untouched, so you can retry.",
+    });
   }
 });
 
