@@ -719,6 +719,18 @@ const COMPUTE_HELP: Record<string, Array<{ flag: string; desc: string; hint?: st
     { flag: '(no args)', desc: 'List available agent install recipes (hermes, openclaw, …)' },
     { flag: '(price)', desc: 'Free' },
   ],
+  renew: [
+    { flag: '<name|id>', desc: 'Buy another billing period for a server' },
+    { flag: '(effect)', desc: 'Extends paid-through; powers the box back on if it was idled for non-payment' },
+    { flag: '(price)', desc: "Same as deploy for that server type — see 'palmyr compute plans'" },
+    { flag: '(example)', desc: 'palmyr compute renew my-agent-box' },
+  ],
+  restore: [
+    { flag: '<id>', desc: 'Rebuild a server destroyed for non-payment, from its termination snapshot' },
+    { flag: '(effect)', desc: 'Creates a NEW server id and IP; the snapshot is kept 30 days after termination' },
+    { flag: '(price)', desc: 'Same as deploy for that server type' },
+    { flag: '(example)', desc: 'palmyr compute restore 165115762' },
+  ],
   'ssh-key': [
     { flag: 'add <pubkey-file>', desc: 'Upload a key to Hetzner', hint: '[--name "label"]' },
     { flag: 'list', desc: 'List uploaded Hetzner SSH keys' },
@@ -1656,7 +1668,7 @@ const TOP_LEVEL_COMMANDS: Array<{ name: string; description: string }> = [
   { name: 'chat', description: 'i402 intent layer: describe an outcome, pay USDC, get a plan (run · resume · status · sessions)' },
   { name: 'phone', description: 'search · buy · sms · call' },
   { name: 'email', description: 'create · read · send · delete' },
-  { name: 'compute', description: 'plans · deploy · list · delete' },
+  { name: 'compute', description: 'plans · deploy · list · renew · delete' },
   { name: 'domain', description: 'check · pricing · buy · dns' },
   { name: 'card', description: 'buy · list · get · refresh' },
   { name: 'wallet', description: 'create · import · list · export · sign · api-key · buy · sell · positions' },
@@ -3011,6 +3023,27 @@ async function main() {
           }
           case 'list': {
             const data = await ao.computeList()
+            return print(data)
+          }
+          case 'renew': {
+            // Accepts a friendly name from the local cache or a numeric
+            // Hetzner id, same as rename/exec.
+            const csshMod = await import('./compute-ssh.js')
+            const target = positional[0] || (flags.id as string) || (flags.name as string)
+            if (!target) err('Usage: palmyr compute renew <name|id>', EXIT.BAD_INPUT)
+            const cached = csshMod.findCachedServer(target)
+            const serverId = cached?.id || (/^\d+$/.test(target) ? target : null)
+            if (!serverId) err(`Server "${target}" not in local cache. Pass the numeric id, or run 'palmyr compute list' to refresh.`, EXIT.NOT_FOUND)
+            const data = await ao.computeRenew(serverId)
+            return print(data)
+          }
+          case 'restore': {
+            // A terminated server is gone from the local cache's point of
+            // view, so this one takes the numeric id straight from the
+            // termination notice.
+            const id = (flags.id as string) || positional[0]
+            if (!id) err('Usage: palmyr compute restore <id>', EXIT.BAD_INPUT)
+            const data = await ao.computeRestore(id)
             return print(data)
           }
           case 'delete': {

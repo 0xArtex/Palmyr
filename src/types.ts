@@ -231,6 +231,17 @@ export interface Server {
   priceMonthly: string;
   createdAt: string;
   rootPassword: string | null;
+  /**
+   * Billing period + lapse-ladder state. Optional because createServer builds a
+   * Server before the period is written; storage always reads them back.
+   * See services/compute-lifecycle.ts for how the ladder advances.
+   */
+  paidThrough?: string | null;
+  expiryNotifiedAt?: string | null;
+  idledAt?: string | null;
+  terminatedAt?: string | null;
+  snapshotId?: string | null;
+  snapshotExpiresAt?: string | null;
 }
 
 // ── Pricing ───────────────────────────────────────────────────

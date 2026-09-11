@@ -399,7 +399,10 @@ export async function createServer(
   const payload: any = {
     name,
     server_type: serverType,
-    image,
+    // Hetzner takes either an image slug ("ubuntu-24.04") or a numeric image
+    // id. Restoring a lapsed server passes the snapshot id, which arrives here
+    // as a string, and the API rejects a numeric-looking slug — so coerce.
+    image: /^\d+$/.test(image) ? Number(image) : image,
     location: location || config.hcloudLocation,
     labels: { managed_by: "palmyr" },
   };
@@ -448,6 +451,31 @@ export async function createServer(
 }
 
 /**
+ * Snapshot a server's disk and return the new image id.
+ *
+ * Used by the lapse ladder before it destroys a server whose billing period
+ * ran out: Hetzner keeps charging for a merely powered-off box, so stopping
+ * the bleed means deleting it — and deleting it without a snapshot would turn
+ * a missed renewal into permanent data loss. The snapshot costs ~EUR0.011/GB/mo
+ * and is what `POST /compute/servers/:id/restore` rebuilds from.
+ */
+export async function createSnapshot(id: string, description: string): Promise<string> {
+  const data = await hcloud("POST", `/servers/${id}/actions/create_image`, {
+    type: "snapshot",
+    description,
+    labels: { managed_by: "palmyr", reason: "lapsed" },
+  });
+  const imageId = data?.image?.id;
+  if (!imageId) throw new Error(`Hetzner returned no image id for snapshot of server ${id}`);
+  return String(imageId);
+}
+
+/** Delete a snapshot/image by id. Used to GC retained snapshots. */
+export async function deleteImage(imageId: string): Promise<void> {
+  await hcloud("DELETE", `/images/${imageId}`);
+}
+
+/**
  * Delete / terminate a server.
  */
 export async function deleteServer(id: string): Promise<void> {
@@ -456,6 +484,42 @@ export async function deleteServer(id: string): Promise<void> {
 
   await hcloud("DELETE", `/servers/${id}`);
   storage.deleteServer(id);
+}
+
+/**
+ * Does this server still exist at Hetzner?
+ *
+ * Our `servers` table outlives the boxes in it — several rows point at servers
+ * deleted directly in the Hetzner console, and one still reads "running" years
+ * after the box went away. The lapse ladder consults this before it acts, so a
+ * stale row is reconciled quietly instead of mailing its owner about a server
+ * that no longer exists and then retrying a poweroff against a 404 forever.
+ *
+ * Only a definitive 404 answers false; any other failure (network, 5xx, auth)
+ * rethrows, because treating an outage as "the server is gone" would strand
+ * live servers.
+ */
+export async function serverExistsAtProvider(id: string): Promise<boolean> {
+  try {
+    await hcloud("GET", `/servers/${id}`);
+    return true;
+  } catch (err) {
+    if (err instanceof HcloudApiError && err.status === 404) return false;
+    throw err;
+  }
+}
+
+/**
+ * Destroy the box at Hetzner but KEEP the local row.
+ *
+ * The lapse ladder needs the record to survive termination — it holds the
+ * snapshot id the owner restores from, and the terminated_at that tells
+ * `GET /compute/servers` to report the server as recoverable rather than
+ * simply vanishing. `deleteServer` (the owner-initiated destroy) drops the row
+ * because that one really is final.
+ */
+export async function destroyServerAtProvider(id: string): Promise<void> {
+  await hcloud("DELETE", `/servers/${id}`);
 }
 
 /**

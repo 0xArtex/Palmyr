@@ -665,14 +665,53 @@ class Storage {
   // ── Compute ────────────────────────────────────────────────
 
   setServer(id: string, server: Server): void {
-    // INSERT OR REPLACE wipes the whole row, so carry the openclaw_configured
-    // flag forward from any existing row — getServer/serverAction/resize/rename
-    // all re-save via this path and would otherwise reset a configured box to 0.
+    // INSERT OR REPLACE wipes the whole row, so every column this method does
+    // not take as an argument has to be carried forward from the existing row —
+    // getServer/serverAction/resize/rename all re-save through here. Without
+    // the carry, a plain status refresh would reset a configured box to
+    // openclaw_configured = 0 and, worse, blank the billing-period columns, so
+    // an expired server would silently look freshly paid on every poll.
+    // Named parameters so `id` can be reused across the sub-selects.
     const stmt = db.prepare(`
-      INSERT OR REPLACE INTO servers (id, name, server_type, image, status, ipv4, ipv6, owner, price_monthly, created_at, root_password, openclaw_configured)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT openclaw_configured FROM servers WHERE id = ?), 0))
+      INSERT OR REPLACE INTO servers (
+        id, name, server_type, image, status, ipv4, ipv6, owner, price_monthly, created_at, root_password,
+        openclaw_configured,
+        paid_through, expiry_notified_at, idled_at, terminated_at, snapshot_id, snapshot_expires_at
+      ) VALUES (
+        @id, @name, @serverType, @image, @status, @ipv4, @ipv6, @owner, @priceMonthly, @createdAt, @rootPassword,
+        COALESCE((SELECT openclaw_configured  FROM servers WHERE id = @id), 0),
+        (SELECT paid_through        FROM servers WHERE id = @id),
+        (SELECT expiry_notified_at  FROM servers WHERE id = @id),
+        (SELECT idled_at            FROM servers WHERE id = @id),
+        (SELECT terminated_at       FROM servers WHERE id = @id),
+        (SELECT snapshot_id         FROM servers WHERE id = @id),
+        (SELECT snapshot_expires_at FROM servers WHERE id = @id)
+      )
     `);
-    stmt.run(id, server.name, server.serverType, server.image, server.status, server.ipv4, server.ipv6, server.owner, server.priceMonthly, server.createdAt, encryptRootPassword(server.rootPassword), id);
+    stmt.run({
+      id,
+      name: server.name,
+      serverType: server.serverType,
+      image: server.image,
+      status: server.status,
+      ipv4: server.ipv4,
+      ipv6: server.ipv6,
+      owner: server.owner,
+      priceMonthly: server.priceMonthly,
+      createdAt: server.createdAt,
+      rootPassword: encryptRootPassword(server.rootPassword),
+    });
+  }
+
+  /**
+   * Set a server's paid-through date — the only writer of the billing period
+   * outside the lapse ladder. Called on deploy (create + one period) and on
+   * renew (extend by one more). Renewing early stacks on the remaining time
+   * instead of throwing it away, so an agent that renews a week ahead doesn't
+   * lose that week.
+   */
+  setServerPaidThrough(id: string, paidThrough: string): void {
+    db.prepare('UPDATE servers SET paid_through = ? WHERE id = ?').run(paidThrough, id);
   }
 
   getServer(id: string): Server | undefined {
@@ -691,7 +730,13 @@ class Storage {
       owner: row.owner,
       priceMonthly: row.price_monthly,
       createdAt: row.created_at,
-      rootPassword: decryptRootPassword(row.root_password)
+      rootPassword: decryptRootPassword(row.root_password),
+      paidThrough: row.paid_through ?? null,
+      expiryNotifiedAt: row.expiry_notified_at ?? null,
+      idledAt: row.idled_at ?? null,
+      terminatedAt: row.terminated_at ?? null,
+      snapshotId: row.snapshot_id ?? null,
+      snapshotExpiresAt: row.snapshot_expires_at ?? null,
     };
   }
 
@@ -725,6 +770,12 @@ class Storage {
       createdAt: row.created_at,
       rootPassword: decryptRootPassword(row.root_password),
       openclawConfigured: !!row.openclaw_configured,
+      paidThrough: row.paid_through ?? null,
+      expiryNotifiedAt: row.expiry_notified_at ?? null,
+      idledAt: row.idled_at ?? null,
+      terminatedAt: row.terminated_at ?? null,
+      snapshotId: row.snapshot_id ?? null,
+      snapshotExpiresAt: row.snapshot_expires_at ?? null,
     }));
   }
 
