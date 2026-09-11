@@ -308,6 +308,15 @@ async function notifyExpired(): Promise<number> {
     const idleAt = new Date(Date.now() + NOTIFY_TO_IDLE_DAYS * 86_400_000).toISOString();
     const terminateAt = new Date(Date.now() + NOTIFY_TO_TERMINATE_DAYS * 86_400_000).toISOString();
 
+    // Quote the LIVE catalog price — the same number the renew paywall will
+    // charge. `price_monthly` is what this tenant paid at deploy time and can
+    // be months stale (cpx32 has since gone $25 -> $63); quoting it would
+    // promise a price we then refuse. Call out the change so the difference
+    // isn't a surprise at the paywall.
+    const renewPrice = computeService.priceForServerType(row.server_type).toFixed(2);
+    const paidBefore = Number(row.price_monthly);
+    const priceChanged = Number.isFinite(paidBefore) && paidBefore.toFixed(2) !== renewPrice;
+
     const delivered = await notifyOwner(
       row.owner,
       "server.billing.expired",
@@ -315,9 +324,12 @@ async function notifyExpired(): Promise<number> {
       [
         `Your server "${row.name}" (${row.id}, ${row.server_type}) reached the end of its paid period on ${row.paid_through}.`,
         ``,
-        `Renew for ${row.price_monthly} USDC to keep it running:`,
+        `Renew for ${renewPrice} USDC to keep it running:`,
         `  POST /compute/servers/${row.id}/renew`,
         `  palmyr compute renew ${row.id}`,
+        ...(priceChanged
+          ? [``, `(You paid ${paidBefore.toFixed(2)} USDC when you deployed. ${renewPrice} is the current ${row.server_type} price — see GET /compute/plans.)`]
+          : []),
         ``,
         `If it is still unpaid:`,
         `  ${idleAt} — powered off (disk kept intact, renew powers it back on)`,
@@ -329,7 +341,8 @@ async function notifyExpired(): Promise<number> {
         serverId: row.id,
         serverName: row.name,
         paidThrough: row.paid_through,
-        priceUsdc: row.price_monthly,
+        priceUsdc: renewPrice,
+        ...(priceChanged ? { previousPriceUsdc: paidBefore.toFixed(2) } : {}),
         idleAt,
         terminateAt,
         renew: `POST /compute/servers/${row.id}/renew`,

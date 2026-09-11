@@ -5,7 +5,7 @@ import { requireAuth } from "../middleware/auth";
 import { rateLimit } from "../middleware/rateLimit";
 import { AuthenticatedRequest, ServerAction } from "../types";
 import * as computeService from "../services/compute";
-import { HcloudApiError } from "../services/compute";
+import { HcloudApiError, priceForServerType } from "../services/compute";
 import { refundAndRespond } from "../services/refund";
 import {
   extendPaidThrough,
@@ -181,27 +181,12 @@ function sshWriteFile(ssh: string, remotePath: string, content: string, opts: { 
 }
 
 // ── Deploy pricing ────────────────────────────────────────────
-//
-// Flat fallback when a type's live price can't be resolved (catalog in static
-// fallback mode, or an unrecognized type slipped through). Matches the historic
-// deploy price so we never charge $0 or throw at the paywall.
-const DEPLOY_PRICE_FALLBACK_USDC = 6.0;
 
-/**
- * Resolve the deploy price for a server type from the live plan catalog so the
- * x402 charge MATCHES the per-type price advertised by GET /compute/plans
- * (audit finding #47 — POST /servers used to charge a flat $6 while plans quote
- * $7–$50+/type). `plans` is injectable for tests. Falls back to the flat price
- * when the type isn't in the catalog.
- */
-export function priceForServerType(
-  serverType: string,
-  plans: { type: string; priceUsdc: string | number }[] = computeService.getServerPlans(),
-): number {
-  const plan = plans.find(p => p.type === serverType);
-  const n = plan ? Number(plan.priceUsdc) : NaN;
-  return Number.isFinite(n) && n > 0 ? n : DEPLOY_PRICE_FALLBACK_USDC;
-}
+// The canonical resolver lives in the service layer — the lapse ladder needs it
+// too, and a second copy could drift from the one the paywall charges.
+// Re-exported here because it has always been part of this module's surface
+// (compute-hardening.test.ts imports it from the route).
+export { priceForServerType };
 
 /**
  * x402 pricer for POST /compute/servers. Reads the RESOLVED serverType from the

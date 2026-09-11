@@ -179,6 +179,32 @@ describe("compute lifecycle — VPS billing period", () => {
     assert.match(inbox[0].body, /renew/i);
   });
 
+  it("quotes the live catalog price, not the stale price paid at deploy", async () => {
+    // The row stores 7.00 (what this tenant paid); the catalog is the source
+    // of truth for what renew will actually charge.
+    insertServer("priced-1", { paidThrough: iso(-1) });
+    const live = computeService.priceForServerType("cx23").toFixed(2);
+
+    await sweepLapsedServers();
+
+    const body = (db
+      .prepare("SELECT body FROM agent_inbox WHERE to_agent = ?")
+      .get(OWNER) as any).body as string;
+
+    assert.ok(
+      body.includes(`Renew for ${live} USDC`),
+      `notice must quote the live price (${live}); got:
+${body}`,
+    );
+    if (live !== "7.00") {
+      assert.match(
+        body,
+        /You paid 7\.00 USDC when you deployed/,
+        "a changed price must be called out, not sprung at the paywall",
+      );
+    }
+  });
+
   it("notifies only once, however long the server stays overdue", async () => {
     insertServer("lapsed-2", { paidThrough: iso(-1) });
 

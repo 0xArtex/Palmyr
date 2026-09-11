@@ -700,6 +700,33 @@ export async function resizeServer(id: string, serverType: ServerType, upgradeDi
   return data.action;
 }
 
+// ── Deploy / renewal pricing ──────────────────────────────────
+//
+// Flat fallback when a type's live price can't be resolved (catalog in static
+// fallback mode, or an unrecognized type slipped through). Matches the historic
+// deploy price so we never charge $0 or throw at the paywall.
+export const DEPLOY_PRICE_FALLBACK_USDC = 6.0;
+
+/**
+ * Resolve the current price for a server type from the live plan catalog.
+ *
+ * The single source of truth for what a box costs, used by the deploy paywall,
+ * the renew/restore paywall, AND the expiry notice. They have to agree: the
+ * catalog tracks Hetzner, so a type's price drifts over time (cpx32 went
+ * $25 -> $63), and quoting a tenant the price they paid months ago while the
+ * paywall charges today's would be its own bug.
+ *
+ * `plans` is injectable for tests.
+ */
+export function priceForServerType(
+  serverType: string,
+  plans: { type: string; priceUsdc: string | number }[] = getServerPlans(),
+): number {
+  const plan = plans.find(p => p.type === serverType);
+  const n = plan ? Number(plan.priceUsdc) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEPLOY_PRICE_FALLBACK_USDC;
+}
+
 export function getPlans(opts: { location?: string } = {}) {
   const all = getServerPlans();
   const filtered = opts.location
