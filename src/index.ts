@@ -627,6 +627,12 @@ app.listen(config.port, () => {
   // ever ended the period, so one deploy fee ran a box indefinitely.
   // PALMYR_VPS_LIFECYCLE_DISABLED=1 turns the whole sweep off.
   void import("./services/compute-lifecycle").then(m => m.startComputeLifecycle());
+  // Keep suspended accounts out of the storefront and refund buyers who got
+  // one before anybody noticed. Nothing watched pool stock after seeding until
+  // a manual audit found 13 suspended accounts — two still listed for sale.
+  // Free to run (twitterapi.io bills 0 credits for both endpoints it uses).
+  // PALMYR_POOL_HEALTH_DISABLED=1 turns it off.
+  void import("./services/pool-health-sweep").then(m => m.startPoolHealthSweep());
   if (embeddingsAvailable()) {
     // Non-blocking: compute any missing provider embeddings in the background.
     ensureProviderEmbeddings().catch(err =>

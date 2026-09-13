@@ -67,6 +67,27 @@ export interface UserInfo {
   affiliate_username: string | null;
   /** Number of times the @handle has been renamed (0 = never). */
   username_change_count: number | null;
+  /**
+   * X's profile display name (not the @handle). Pool stock is seeded with a
+   * persona name matching its handle; when this drifts, the account is being
+   * driven by someone other than us and is no longer deliverable as listed.
+   */
+  display_name: string | null;
+  /**
+   * Raw `unavailableReason` from X when the account is withdrawn ("Suspended").
+   * Null for live accounts. Kept verbatim for the dispute audit trail.
+   */
+  unavailable_reason: string | null;
+}
+
+/**
+ * twitterapi.io signals a dead handle with `status:"error"` + this message,
+ * which is indistinguishable from a handle that never existed. Every other
+ * error message means the call itself failed and carries no signal about the
+ * account, so the match stays deliberately narrow.
+ */
+function isUserNotFound(msg: unknown): boolean {
+  return typeof msg === "string" && /user not found/i.test(msg);
 }
 
 /**
@@ -79,15 +100,36 @@ export interface UserInfo {
  * it for country derivation. account_based_in is the only signal we trust.
  *
  * Status mapping:
- *   200 with data    → "active"
- *   200 with status=error → "unknown" (treat as no signal — admin review)
- *   404              → "not_found" (suspended or deleted — dispute service
- *                      handles both the same way)
- *   any other        → null (no signal)
+ *   200, data.unavailable=true, reason ~ /suspend/ → "suspended"
+ *   200, data.unavailable=true, any other reason   → "not_found" (gone)
+ *   200 with data                                   → "active"
+ *   200 status=error, msg "user not found"          → "not_found" (handle gone)
+ *   200 status=error, any other msg                 → null (no signal)
+ *   404                                             → "not_found"
+ *   any other                                       → null (no signal)
  *
- * The endpoint does NOT include a suspension flag in 200 responses — X
- * removes suspended profiles entirely, so a 404 is the signal. This is why
- * the dispute service treats not_found identically to suspended.
+ * Both unavailable-shapes were previously misread, and each one cost real
+ * money before it was found (2026-09-13):
+ *
+ *   • A suspended account normally answers 200 with
+ *     `{status:"success", data:{unavailable:true, unavailableReason:"Suspended"}}`
+ *     — NOT a 404. This function only read `about_profile`, so it reported
+ *     those accounts as **active**, and `createDispute()` auto-REJECTS on
+ *     "active". Buyers holding a suspended account were told it was fine.
+ *     13 suspended accounts sat undetected in the pool this way.
+ *
+ *   • A handle that no longer exists answers 200 with
+ *     `{status:"error", msg:"user not found"}`, byte-identical to a handle
+ *     that never existed. That was mapped to null ("no signal"), so a
+ *     suspension was never auto-detectable by handle either.
+ *
+ * `status:"error"` with any OTHER msg really is a no-signal condition (plan
+ * tier, upstream hiccup) and still returns null, so a bad API day can never
+ * be mistaken for a dead account.
+ *
+ * A 404 by handle is still ambiguous on its own — a RENAMED account 404s too.
+ * Callers holding a `rest_id` should confirm with getUserInfoById(), which
+ * separates "suspended" from "renamed, still alive".
  *
  * Docs: https://docs.twitterapi.io/api-reference/endpoint/get_user_about
  */
@@ -111,13 +153,29 @@ export async function getUserInfo(username: string): Promise<UserInfo | null> {
 
     const body = await res.json() as any;
     // user_about wraps the payload in { data, status, msg }. status='error'
-    // means the call succeeded HTTP-wise but the API can't service this
-    // handle (e.g. plan-tier limit) — treat as no signal.
+    // covers two very different cases, so the msg decides: "user not found"
+    // means the handle is genuinely gone (same response a never-existed handle
+    // gets), while anything else (plan-tier limit, upstream hiccup) is a
+    // no-signal condition the caller must not act on.
     if (body?.status === "error") {
+      if (isUserNotFound(body?.msg)) {
+        return emptyUserInfo(handle, "not_found");
+      }
       console.warn(`[twitter-api] ${handle} returned status=error:`, body?.msg);
       return null;
     }
     const data = body?.data || body;
+
+    // A suspended (or otherwise withdrawn) account comes back 200/success with
+    // an `unavailable` flag and no about_profile — NOT a 404. Check this before
+    // anything else: the rest of the payload is empty for these, which is
+    // exactly how they used to be misread as healthy.
+    if (data?.unavailable === true) {
+      const reason = data?.unavailableReason ? String(data.unavailableReason) : null;
+      const status: AccountStatus = /suspend/i.test(reason || "") ? "suspended" : "not_found";
+      return { ...emptyUserInfo(handle, status), unavailable_reason: reason };
+    }
+
     const about = data?.about_profile || {};
 
     // Stable numeric id — captured here so the row can be re-checked by id
@@ -157,6 +215,8 @@ export async function getUserInfo(username: string): Promise<UserInfo | null> {
       registered_platform,
       affiliate_username,
       username_change_count,
+      display_name: data?.name ? String(data.name) : null,
+      unavailable_reason: null,
     };
   } catch (e: any) {
     console.warn(`[twitter-api] ${handle} threw:`, e?.message || e);
@@ -185,47 +245,76 @@ export async function getUserInfo(username: string): Promise<UserInfo | null> {
  * Docs: https://docs.twitterapi.io/api-reference/endpoint/batch_get_user_by_userids
  */
 export async function getUserInfoById(restId: string): Promise<UserInfo | null> {
-  const key = apiKey();
-  if (!key) return null;
   const id = restId ? String(restId).trim() : "";
   if (!id) return null;
+  const byId = await getUserInfosByIds([id]);
+  return byId.get(id) ?? null;
+}
 
-  try {
-    const url = `${BASE}/twitter/user/batch_info_by_ids?userIds=${encodeURIComponent(id)}`;
-    const res = await fetch(url, { headers: { "X-API-Key": key } });
-    if (!res.ok) {
-      console.warn(`[twitter-api] id ${id} → HTTP ${res.status}`);
-      return null;
+/** The endpoint accepts up to 100 ids per call — and bills the same as one. */
+const BATCH_IDS_PER_CALL = 100;
+
+/**
+ * Batched form of getUserInfoById. Resolves many ids in chunks of 100, which
+ * is what makes a whole-pool health sweep essentially free: one call covers
+ * every account needing an id re-check instead of one call each.
+ *
+ * Returns a Map keyed by the id that was asked for. A missing key (or a null
+ * value) means "no signal" — the chunk failed — and must NOT be read as the
+ * account being gone.
+ */
+export async function getUserInfosByIds(restIds: string[]): Promise<Map<string, UserInfo | null>> {
+  const out = new Map<string, UserInfo | null>();
+  const key = apiKey();
+  const ids = [...new Set(restIds.map((r) => String(r || "").trim()).filter(Boolean))];
+  if (!key || ids.length === 0) return out;
+
+  for (let i = 0; i < ids.length; i += BATCH_IDS_PER_CALL) {
+    const chunk = ids.slice(i, i + BATCH_IDS_PER_CALL);
+    try {
+      const url = `${BASE}/twitter/user/batch_info_by_ids?userIds=${chunk.map(encodeURIComponent).join(",")}`;
+      const res = await fetch(url, { headers: { "X-API-Key": key } });
+      if (!res.ok) {
+        console.warn(`[twitter-api] batch of ${chunk.length} → HTTP ${res.status}`);
+        continue; // leave the chunk unset = no signal
+      }
+
+      const body = await res.json() as any;
+      // Same { users, status, msg } envelope contract as user_about — status
+      // 'error' means the call couldn't be serviced (plan tier, etc.) → no signal.
+      if (body?.status === "error") {
+        console.warn(`[twitter-api] batch returned status=error:`, body?.msg);
+        continue;
+      }
+
+      const users: any[] = Array.isArray(body?.users) ? body.users : [];
+      for (const id of chunk) {
+        const user = users.find((u) => String(u?.id) === id) || null;
+        if (!user) {
+          // The endpoint returns suspended ids WITH an unavailable flag rather
+          // than omitting them, so an id absent from a successful response
+          // resolves to nothing at all → deleted / gone.
+          out.set(id, { ...emptyUserInfo("", "not_found"), rest_id: id });
+          continue;
+        }
+        const handle = user?.userName ? String(user.userName).replace(/^@/, "") : "";
+        if (user?.unavailable === true || user?.unavailableReason) {
+          const reason = user?.unavailableReason ? String(user.unavailableReason) : null;
+          // Distinguish the two: a suspension is our fault to make good on,
+          // a deletion by the owner is not the same event.
+          const status: AccountStatus = /suspend/i.test(reason || "") ? "suspended" : "not_found";
+          out.set(id, { ...emptyUserInfo(handle, status), rest_id: id, unavailable_reason: reason });
+          continue;
+        }
+        // Live account. Surface the CURRENT handle so the caller can detect a
+        // rebrand (recorded handle !== current handle).
+        out.set(id, { ...emptyUserInfo(handle, "active"), rest_id: id, display_name: user?.name ? String(user.name) : null });
+      }
+    } catch (e: any) {
+      console.warn(`[twitter-api] batch threw:`, e?.message || e);
     }
-
-    const body = await res.json() as any;
-    // Same { users, status, msg } envelope contract as user_about — status
-    // 'error' means the call couldn't be serviced (plan tier, etc.) → no signal.
-    if (body?.status === "error") {
-      console.warn(`[twitter-api] id ${id} returned status=error:`, body?.msg);
-      return null;
-    }
-
-    const users: any[] = Array.isArray(body?.users) ? body.users : [];
-    const user = users.find((u) => String(u?.id) === id) || users[0] || null;
-    if (!user) {
-      // id resolves to nothing at all → deleted / gone.
-      return { ...emptyUserInfo("", "not_found"), rest_id: id };
-    }
-
-    const handle = user?.userName ? String(user.userName).replace(/^@/, "") : "";
-    if (user?.unavailable === true || user?.unavailableReason) {
-      // suspended / deleted — genuinely gone.
-      return { ...emptyUserInfo(handle, "not_found"), rest_id: id };
-    }
-
-    // Live account. Surface the CURRENT handle so the caller can detect a
-    // rebrand (recorded handle !== current handle).
-    return { ...emptyUserInfo(handle, "active"), rest_id: id };
-  } catch (e: any) {
-    console.warn(`[twitter-api] id ${id} threw:`, e?.message || e);
-    return null;
   }
+  return out;
 }
 
 function emptyUserInfo(username: string, status: AccountStatus): UserInfo {
@@ -242,6 +331,8 @@ function emptyUserInfo(username: string, status: AccountStatus): UserInfo {
     registered_platform: null,
     affiliate_username: null,
     username_change_count: null,
+    display_name: null,
+    unavailable_reason: null,
   };
 }
 
