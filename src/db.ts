@@ -1048,6 +1048,11 @@ export function initDatabase(): void {
     ['account_based_in', 'TEXT'],           // free-text "United States, California"
     ['location_accurate', 'INTEGER'],       // 0/1 from twitterapi.io
     ['affiliate_username', 'TEXT'],         // org account handle, if any
+    // X profile display name as first observed by the health sweep. Pool
+    // personas are seeded with a name matching the handle, so a later change
+    // means someone else is driving the account — see pool-health-sweep.ts.
+    ['seed_display_name', 'TEXT'],
+    ['health_checked_at', 'TEXT'],          // last health-sweep observation
   ] as const) {
     if (!poolColNames.has(col)) db.exec(`ALTER TABLE social_account_pool ADD COLUMN ${col} ${spec}`);
   }

@@ -44,7 +44,13 @@ import { randomUUID } from "crypto";
 import { getUserInfo, getUserInfoById } from "./twitter-api";
 import { refundUsdcToPayer } from "./refund";
 
-const DISPUTE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * How long after a sale a buyer can still dispute. Exported because the pool
+ * health sweep refunds suspended accounts on the buyer's behalf and uses the
+ * same cutoff — if the buyer could still have claimed it themselves, we do it
+ * for them rather than waiting for them to notice.
+ */
+export const DISPUTE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Self-contained schema guard: the rebrand-fraud check reads social_account_pool.rest_id,
 // but this module deliberately does NOT import social-pool.ts (that would pull
